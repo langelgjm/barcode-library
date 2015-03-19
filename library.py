@@ -15,6 +15,15 @@ def make_config_dict(cp):
         d[s] = e
     return d
 
+config_file = "library.conf"
+config = ConfigParser.ConfigParser()
+config.read(config_file)
+myconfig = make_config_dict(config)   
+#    working_directory = myconfig['general']['working_directory']
+api_key = myconfig['secrets']['api_key']
+db_file = myconfig['general']['db_file']
+api_url_base = myconfig['general']['api_url_base']
+
 def make_isbndb_api_str(api_url_base, ver, fmt, api_key, endpoint, isbn_or_upc):
     s = "/"
     seq = (api_url_base, ver, fmt, api_key, endpoint, isbn_or_upc)
@@ -53,20 +62,34 @@ def make_library_tables(c):
                                         subject TEXT,
                                         FOREIGN KEY(subj_lib_id) REFERENCES library(lib_id)
                                         )''')
+    c.execute('''CREATE TABLE prices (price_id INTEGER PRIMARY KEY,
+                                        price_lib_id INTEGER,
+                                        currency_code TEXT,
+                                        in_stock INTEGER,
+                                        is_historic INTEGER,
+                                        is_new INTEGER,
+                                        price REAL,
+                                        price_time_unix INTEGER,
+                                        store_id TEXT,
+                                        store_title TEXT,
+                                        store_url TEXT,
+                                        FOREIGN KEY(price_lib_id) REFERENCES library(lib_id)
+                                        )''')
 
-def get_book(c, isbn10 = None, isbn13 = None):
+def parse_isbn(isbn):
+    if len(isbn)==10:
+        isbn_type = "isbn10"
+    elif len(isbn)==13:
+        isbn_type = "isbn13"
+    else:
+        isbn_type = "invalid"
+    return {"isbn_type": isbn_type, "isbn":isbn}
+
+def get_book(c, isbn):
     '''
     Return book data from the db; if book not found, return false.
-    Takes a cursor and a two additional arguments, isbn10 and isbn13, either one of which may be None
     '''
-    if isbn10 is None and isbn13 is None:
-        return False
-    # In case we pass in a 13 when we meant a 10, or vice versa
-    elif isbn13 is None:
-        isbn13 = isbn10
-    elif isbn10 is None:
-        isbn10 = isbn13
-    r = c.execute('''SELECT * FROM library WHERE isbn10==? OR isbn13==?''', (isbn10, isbn13))
+    r = c.execute('''SELECT * FROM library WHERE ''' + isbn["isbn_type"] + '''=?''', (isbn["isbn"],))
     book = r.fetchone()        
     if book is None:
         return False
@@ -95,57 +118,76 @@ def insert_book(c, book):
     c.execute('UPDATE library SET author_name=? WHERE ROWID=?', (author_name, pk))
     while book["subject_ids"]:
         c.execute('INSERT INTO subjects (subj_lib_id, subject) VALUES (?, ?)', (pk, book["subject_ids"].pop()))
+        
+    # Now get price info and insert it too
+    # I am not sure if ISBNDB automatically converts 10 to 13 when necessary...
+    url = make_isbndb_api_str(api_url_base, "v2", "json", api_key, "prices", book["isbn13"])
+    r = requests.get(url, params={'opt': 'keystats'})
+    if "error" in r.json().keys():
+        pass
+    else:
+        prices = r.json()["data"]
+        for p in prices:
+            price_tuple = (pk, p["currency_code"], p["in_stock"], p["is_historic"], p["is_new"], p["price"], p["price_time_unix"], p["store_id"], p["store_title"], p["store_url"])
+            c.execute('INSERT INTO prices (price_lib_id, currency_code, in_stock, is_historic, is_new, price, price_time_unix, store_id, store_title, store_url) VALUES (?,?,?,?,?,?,?,?,?,?)', price_tuple)
     return pk
 
-def main():
-    if len(sys.argv) < 2:
-        print "Usage: python " + sys.argv[0] + " <ISBN-10, ISBN-13, or UPC> (TRUE to initialize DB)"
-        sys.exit()
-        
-    isbn = sys.argv[1]
-    try:
-        if sys.argv[2] == "TRUE":
-            initialize_db = True
-    except IndexError:
-        initialize_db = False
-    
-    config_file = "library.conf"
-    config = ConfigParser.ConfigParser()
-    config.read(config_file)
-    myconfig = make_config_dict(config)
-    
-#    working_directory = myconfig['general']['working_directory']
-    api_key = myconfig['secrets']['api_key']
-    db_file = myconfig['general']['db_file']
-    api_url_base = myconfig['general']['api_url_base']
-
+def make_library_db(db_file):
     conn = sqlite3.connect(db_file)
     c = conn.cursor()
+    make_library_tables(c)
+    conn.commit()
+    return conn
+
+def delete_book(c, isbn):
+    (pk, ) = c.execute('SELECT lib_id FROM library WHERE ' + isbn["isbn_type"] + '=?', (isbn["isbn"],)).fetchone()
+    c.execute('DELETE FROM subjects WHERE subj_lib_id=?', (pk,))
+    c.execute('DELETE FROM prices WHERE price_lib_id=?', (pk,))
+    c.execute('DELETE FROM library WHERE lib_id=?', (pk,))
+
+def main():
+    try:
+        if sys.argv[1] == "TRUE":
+            conn = make_library_db(db_file)
+            print "Successfully initialized database."
+    except IndexError:
+        conn = sqlite3.connect(db_file)
+    finally:
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
     
-    if initialize_db:
-        make_library_tables(c)
-        conn.commit()
-        print "Successfully initialized database."
-
-    if not get_book(c, isbn):
-        url = make_isbndb_api_str(api_url_base, "v2", "json", api_key, "book", isbn)
-        payload = {'opt': 'keystats'}
-        r = requests.get(url, params=payload)
-        
-        if "error" in r.json().keys():
-            print r.json()["error"]
-            conn.close()
-            sys.exit()
-        else:
-            book = r.json()["data"][0]
-            print "Found " + isbn + " as '" + book["title"] + "'"
-            insert_book(c, book)
-            conn.commit()
-            print "Successfully inserted " + isbn + "."
-    else:
-        print isbn + " already in database, refusing to insert"
-
-    conn.close()
+    try:
+        while True:
+            isbn = raw_input("Scan barcode or enter ISBN: ")
+            isbn = parse_isbn(isbn)
+            if isbn["isbn_type"] == "invalid":
+                print "Invalid ISBN!"
+                continue
+            elif not get_book(c, isbn):
+                url = make_isbndb_api_str(api_url_base, "v2", "json", api_key, "book", isbn["isbn"])
+                r = requests.get(url, params={'opt': 'keystats'})
+                
+                if "error" in r.json().keys():
+                    print r.json()["error"]
+                else:
+                    book = r.json()["data"][0]
+                    print "Found " + isbn["isbn"] + " as '" + book["title"] + "'"
+                    insert_book(c, book)
+                    conn.commit()
+                    print "Successfully inserted " + isbn["isbn"] + " (" + book["title"] + ")."
+            else:
+                book = get_book(c, isbn)
+                isbn2 = raw_input(isbn["isbn"] + " (" + book["title"] + ") already in database. To delete, scan or enter ISBN again: ")
+                if isbn["isbn"]==isbn2:
+                    delete_book(c, isbn)
+                    conn.commit()
+                    print "Deleted " + isbn["isbn"] + " (" + book["title"] + ")."
+                else:
+                    print "ISBNs did not match!"
+    except KeyboardInterrupt:
+        pass
+    finally:
+        conn.close()
 
 if __name__ == "__main__":
     main()
