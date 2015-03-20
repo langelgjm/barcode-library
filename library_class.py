@@ -2,6 +2,7 @@ import requests
 import ConfigParser
 import sqlite3
 import serial
+import HTML
 
 class Book(object):
     '''
@@ -25,6 +26,35 @@ class Book(object):
         return repr(self.__dict__)
     def __nonzero__(self):
         return True
+    def __keys__(self):
+        return self.__dict__.keys()
+
+class Catalog(object):
+    def __init__(self, library):
+        self.list = library.catalog()
+        self.library = library
+    def __len__(self):
+        return len(self.list)
+    def __repr__(self):
+        return repr(self.list)
+    def __nonzero__(self):
+        return True
+    def write(self, catalog_file):
+        self.catalog_file = catalog_file
+        f = open(self.catalog_file, 'w')
+        mytable = HTML.Table(header_row=["Author", "Title", "Publisher", "ISBN", "Sells For", "Yours For"],
+                            col_align=["left", "left", "left", "left", "right", "right"],
+                            col_styles=["", "font-style: italic", "", "font-size: small", "", "font-weight: bold"])
+        for book in self.list:
+            sells_for = self.library.min_price(book) + 2
+            yours_for = int(sells_for * 0.75)
+            sells_for = "$" + "%.2f" % sells_for
+            yours_for = "$" + "%.2f" % yours_for
+            mytable.rows.append([book.author_name, book.title, book.publisher_name, book.isbn13, sells_for, yours_for])
+        mytable.rows.sort()
+        html = str(mytable)
+        f.write(html)
+        f.close()
 
 class Library(object):
     def __init__(self, db_file, api_key, api_url_base):
@@ -150,7 +180,7 @@ class Library(object):
             print "Cannot remove " + book.title + " (" + book.isbn13 + "): not in library."
     def search(self, isbn):
         '''
-        Needs to be rewritten to handle all possible search queries and return a Book object.
+        Needs to be rewritten to handle all possible search queries
         '''
         isbn = self.fmt_isbn(isbn)
         if isbn["isbn_type"] != "invalid":
@@ -166,7 +196,7 @@ class Library(object):
             return False
     def api_search(self, isbn):
         '''
-        Needs to be rewritten to return a Book object.
+        Search ISBNDB for an ISBN
         '''
         isbn = self.fmt_isbn(isbn)
         if isbn["isbn_type"] != "invalid":
@@ -182,6 +212,17 @@ class Library(object):
                 return book
         else:
             return False
+    def catalog(self):
+        '''
+        Returns a catalog (list of all books in the library) of Books
+        '''
+        rs = self.c.execute('''SELECT isbn13 FROM library''').fetchall()
+        catalog = []
+        for r in rs:
+            (isbn, ) = r
+            book = self.search(isbn)
+            catalog.append(book)
+        return catalog
     def subjects(self, book):
         r = self.c.execute('''SELECT lib_id FROM library WHERE isbn13=?''', (book.isbn13,)).fetchone()
         if r:
@@ -228,6 +269,8 @@ def make_config_dict(cp):
     return d
 
 def main():
+    #import os
+    #os.chdir("/Users/gjm/bin/library")
     config_file = "library.conf"
     config = ConfigParser.ConfigParser()
     config.read(config_file)
@@ -239,15 +282,26 @@ def main():
     serial_port = myconfig['general']['serial_port']
     serial_speed = int(myconfig['general']['serial_speed'])
     
-    ser = serial.Serial(serial_port, serial_speed)
+    try:
+        ser = serial.Serial(serial_port, serial_speed)
+    except OSError:
+        ser = None
+        print "Error opening serial port. Is the barcode scanner plugged in?"
     mylibrary = Library(db_file, api_key, api_url_base)
     
     try:
         while True:
-            print "Scan barcode or enter ISBN: "
+            print "Scan barcode or enter ISBN: ",
             # We probably need to run the serial portion in a separate thread...
-            #isbn = raw_input("Scan barcode or enter ISBN: ")
-            isbn = ser.readline().strip()
+            if ser:
+                isbn = ser.readline().strip()
+            else:
+                isbn = raw_input()
+            if isbn == "catalog":
+                Catalog(mylibrary).write("catalog.html")
+                continue
+            elif isbn == "quit":
+                raise KeyboardInterrupt
             book = mylibrary.search(isbn)
             if not book:
                 book = mylibrary.api_search(isbn)
@@ -262,7 +316,8 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        ser.close()
+        if ser:
+            ser.close()
         mylibrary.close()
 
 if __name__ == "__main__":
