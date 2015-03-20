@@ -19,7 +19,7 @@ config_file = "library.conf"
 config = ConfigParser.ConfigParser()
 config.read(config_file)
 myconfig = make_config_dict(config)   
-#    working_directory = myconfig['general']['working_directory']
+#working_directory = myconfig['general']['working_directory']
 api_key = myconfig['secrets']['api_key']
 db_file = myconfig['general']['db_file']
 api_url_base = myconfig['general']['api_url_base']
