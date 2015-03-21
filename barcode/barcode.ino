@@ -6,7 +6,8 @@ const int IRQpin =  3;
 PS2Keyboard keyboard;
 
 void setup() {
-  delay(1000);
+  pinMode(DataPin, INPUT_PULLUP);
+  pinMode(IRQpin, INPUT_PULLUP);
   keyboard.begin(DataPin, IRQpin);
   Serial.begin(9600);
 }
