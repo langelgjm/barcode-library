@@ -1,3 +1,5 @@
+# todo: add a way to refresh price info from the API
+
 import requests
 import ConfigParser
 import sqlite3
@@ -71,7 +73,11 @@ class Catalog(object):
             else:
                 sells_for = "-"
                 yours_for = "e-mail for price"
-            mytable.rows.append([book.author_name, book.title, book.publisher_name, book.isbn13, sells_for, yours_for])
+            # HTML module can't hande Unicode
+            ascii_strings = []
+            for s in [book.author_name, book.title, book.publisher_name]:
+                ascii_strings.append(s.encode('ascii', errors="replace"))
+            mytable.rows.append([ascii_strings[0], ascii_strings[1], ascii_strings[2], book.isbn13, sells_for, yours_for])
         mytable.rows.sort()
         html = str(mytable)
         f.write(html)
@@ -155,10 +161,22 @@ class Library(object):
         else:
             isbn_type = "invalid"
         return {"isbn_type": isbn_type, "isbn": isbn}
-    def make_isbndb_api_str(self, ver, fmt, endpoint, isbn):
+    def make_isbndb_api_req(self, ver, fmt, endpoint, search_term, search_index=None):
+        '''
+        Construct and sends an API request to ISBN DB. Return the request.
+        '''
         s = "/"
-        seq = (self.api_url_base, ver, fmt, self.api_key, endpoint, isbn)
-        return s.join(seq)
+        p = {'opt': 'keystats'}
+        if endpoint == "books":
+            seq = (self.api_url_base, ver, fmt, self.api_key, endpoint)
+            p['q'] = search_term
+            if search_index:
+                p['i'] = search_index
+        else:
+            seq = (self.api_url_base, ver, fmt, self.api_key, endpoint, search_term)
+        url = s.join(seq)
+        r = requests.get(url, params=p)
+        return r        
     def insert(self, book):
         if not self.search(book.isbn13):
             self.c.execute('INSERT INTO library (isbn10, isbn13) VALUES (?, ?)', (book.isbn10, book.isbn13))
@@ -172,8 +190,7 @@ class Library(object):
                 self.c.execute('INSERT INTO subjects (subj_lib_id, subject) VALUES (?, ?)', (pk, book.subject_ids.pop()))
             # Now get price info and insert it too
             # I am not sure if ISBNDB automatically converts 10 to 13 when necessary...
-            url = self.make_isbndb_api_str("v2", "json", "prices", book.isbn13)
-            r = requests.get(url, params={'opt': 'keystats'})
+            r = self.make_isbndb_api_req("v2", "json", "prices", book.isbn13)
             if "error" in r.json().keys():
                 pass
             else:
@@ -199,40 +216,59 @@ class Library(object):
             print "Removed " + book.title + " (" + book.isbn13 + ") from library."
         else:
             print "Cannot remove " + book.title + " (" + book.isbn13 + "): not in library."
-    def search(self, isbn):
+    def search(self, search_term):
         '''
         Needs to be rewritten to handle all possible search queries
         '''
-        isbn = self.fmt_isbn(isbn)
+        isbn = self.fmt_isbn(search_term)
         if isbn["isbn_type"] != "invalid":
             r = self.c.execute('''SELECT * FROM library WHERE ''' + isbn["isbn_type"] + '''=?''', (isbn["isbn"],))
-            book_data = r.fetchone()     
-            if book_data is None:
-                return False
-            else:
-                book = Book(book_data)
-                print "Found " + book.title + " (" + book.isbn13 + ") in library."
-                return book
-        else:
+        elif search_term.isdigit():
+            # Here we assume that it is simply an invalid ISBN
             return False
-    def api_search(self, isbn):
+        else:
+            # Any other input is treated as a potential title
+            r = self.c.execute('''SELECT * FROM library WHERE title LIKE ?''', ('%' + search_term + '%',))
+
+        book_data = r.fetchall()
+        if not book_data:
+            return False
+        else:
+            books = []
+            for b in book_data:
+                book = Book(b)
+                books.append(book)
+                print "Found " + book.title + " (" + book.isbn13 + ") in library."
+            if len(books) == 1:
+                return books[0]
+            else:
+                # This will break other things that don't expect a list...
+                return books
+    def api_search(self, search_term):
         '''
         Search ISBNDB for an ISBN
         '''
-        isbn = self.fmt_isbn(isbn)
+        isbn = self.fmt_isbn(search_term)
         if isbn["isbn_type"] != "invalid":
-            url = self.make_isbndb_api_str("v2", "json", "book", isbn["isbn"])
-            r = requests.get(url, params={'opt': 'keystats'})
-            if "error" in r.json().keys():
-                print r.json()["error"]
-                return False
-            else:
-                book_data = r.json()["data"][0]
-                book = Book(book_data)
-                print "Found " + book.title + " (" + book.title + ") online."
-                return book
-        else:
+            r = self.make_isbndb_api_req("v2", "json", "book", isbn["isbn"])
+        elif search_term.isdigit():
+            # Here we assume that it is simply an invalid ISBN
             return False
+        else:
+            # Any other input is treated as a potential title
+            r = self.make_isbndb_api_req("v2", "json", "books", search_term)      
+        
+        if "error" in r.json().keys():
+            print r.json()["error"]
+            return False
+        elif len(r.json()['data']) > 1:
+            print "Found multiple matching titles online (currently unsupported)."
+            return False
+        else:
+            book_data = r.json()["data"][0]
+            book = Book(book_data)
+            print "Found " + book.title + " (" + book.title + ") online."
+            return book      
     def catalog(self):
         '''
         Returns a catalog (list of all books in the library) of Books
